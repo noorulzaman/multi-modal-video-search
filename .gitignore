@@ -46,3 +46,7 @@ Thumbs.db
 
 #Dataset
 MSRVTT_Videos.zip
+
+# User-uploaded videos
+data/uploads/*
+!data/uploads/.gitkeep
