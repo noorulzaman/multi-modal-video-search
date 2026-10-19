@@ -62,7 +62,17 @@ def main() -> None:
 
             try:
                 with Image.open(frame_path) as image:
-                    images.append(preprocess(image.convert("RGB")))
+                    rgb_image = image.convert("RGB")
+
+                    # Exclude completely black frames from the search index.
+                    pixels = np.asarray(rgb_image, dtype=np.uint8)
+
+                    if pixels.max() == 0:
+                        print(f"[SKIP] Completely black frame: {frame_path}")
+                        continue
+
+                    images.append(preprocess(rgb_image))
+
                 batch_metadata.append(row.to_dict())
             except Exception as exc:
                 failed_frames.append(
