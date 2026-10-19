@@ -30,6 +30,9 @@ PRETRAINED = "laion2b_s34b_b79k"
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "mkv", "webm"}
 
+MAX_CANDIDATE_MATCHES = 1
+SIMILARITY_THRESHOLD = 0.25
+
 
 # --------------------------------------------------
 # Streamlit configuration
@@ -304,18 +307,15 @@ def search_video_frames(query, top_k, index_path, metadata_path):
             continue
 
         row = metadata.iloc[int(row_index)]
-
         frame_path = ROOT / str(row["frame_path"])
 
         if not frame_path.is_file():
             continue
 
-        timestamp = float(row["timestamp_seconds"])
-
         results.append(
             {
                 "path": frame_path,
-                "timestamp": timestamp,
+                "timestamp": float(row["timestamp_seconds"]),
                 "score": float(score),
             }
         )
@@ -350,7 +350,12 @@ else:
         st.success("Video uploaded successfully.")
 
         st.subheader("Video Preview")
-        st.video(str(video_path))
+
+        # Display the video preview in a narrower column.
+        preview_col, _ = st.columns([1, 2])
+
+        with preview_col:
+            st.video(str(video_path))
 
         col1, col2, col3 = st.columns(3)
 
@@ -467,14 +472,8 @@ if video_path is not None and Path(video_path).is_file():
             status.empty()
             st.error(f"Video processing failed: {exc}")
 
-
 else:
     st.info("Upload a valid video to continue.")
-
-
-# --------------------------------------------------
-# Section 3: Search video using text
-# --------------------------------------------------
 
 
 # --------------------------------------------------
@@ -500,8 +499,8 @@ if video_path is not None and Path(video_path).is_file():
 
     else:
         st.write(
-            "Describe a scene, object, person, or activity. "
-            "The app will find matching moments in your video."
+            "Describe a scene, object, person, or activity "
+            "to find a matching moment in your video."
         )
 
         with st.form("visual_search_form"):
@@ -510,31 +509,6 @@ if video_path is not None and Path(video_path).is_file():
                 placeholder="e.g. a person walking through a room",
             )
 
-            col1, col2 = st.columns(2)
-
-            with col1:
-                top_k = st.slider(
-                    "Maximum candidate matches",
-                    min_value=1,
-                    max_value=20,
-                    value=10,
-                )
-
-            with col2:
-                similarity_threshold = st.slider(
-                    "Minimum similarity threshold",
-                    min_value=0.05,
-                    max_value=0.50,
-                    value=0.20,
-                    step=0.01,
-                    format="%.2f",
-                    help=(
-                        "Only matches with a similarity score at or "
-                        "above this value will be shown. Higher values "
-                        "are stricter, but may exclude relevant scenes."
-                    ),
-                )
-
             submitted = st.form_submit_button(
                 "Search Video",
                 type="primary",
@@ -542,7 +516,7 @@ if video_path is not None and Path(video_path).is_file():
             )
 
         if submitted:
-            # Clear old results so a failed search cannot show stale matches.
+            # Clear previous results to prevent stale results being shown.
             st.session_state.pop("visual_search_results", None)
 
             if not query.strip():
@@ -550,28 +524,32 @@ if video_path is not None and Path(video_path).is_file():
 
             else:
                 try:
-                    with st.spinner("Searching for matching moments..."):
+                    with st.spinner("Searching for a matching moment..."):
                         candidates = search_video_frames(
                             query=query,
-                            top_k=top_k,
+                            top_k=MAX_CANDIDATE_MATCHES,
                             index_path=index_path,
                             metadata_path=metadata_path,
                         )
 
-                    matching_results = [
-                        result
-                        for result in candidates
-                        if result["score"] >= similarity_threshold
-                    ]
+                    best_match = candidates[0] if candidates else None
+
+                    matching_results = (
+                        [best_match]
+                        if (
+                            best_match is not None
+                            and best_match["score"] >= SIMILARITY_THRESHOLD
+                        )
+                        else []
+                    )
 
                     st.session_state["visual_search_results"] = {
                         "upload_id": upload_id,
                         "query": query.strip(),
-                        "threshold": similarity_threshold,
                         "results": matching_results,
                         "best_score": (
-                            candidates[0]["score"]
-                            if candidates
+                            best_match["score"]
+                            if best_match is not None
                             else None
                         ),
                     }
@@ -589,97 +567,58 @@ if video_path is not None and Path(video_path).is_file():
             and saved_results["upload_id"] == upload_id
         ):
             results = saved_results["results"]
-            threshold = saved_results["threshold"]
 
             st.subheader(
-                f'Search results for "{saved_results["query"]}"'
-            )
-
-            st.caption(
-                f"Minimum similarity: {threshold:.2f}"
+                f'Results for "{saved_results["query"]}"'
             )
 
             if not results:
                 best_score = saved_results["best_score"]
 
                 st.warning(
-                    "No sufficiently similar moments were found "
-                    "among the retrieved candidates."
+                    "No sufficiently similar match was found. "
+                    "The strongest candidate did not meet the "
+                    "required similarity threshold."
                 )
 
                 if best_score is not None:
                     st.write(
-                        f"The strongest candidate scored "
-                        f"{best_score:.3f}, below your threshold "
-                        f"of {threshold:.2f}."
+                        f"Best candidate similarity: {best_score:.3f}. "
+                        f"Required minimum: {SIMILARITY_THRESHOLD:.2f}."
                     )
 
-                st.write(
-                    "Try lowering the threshold or using a more "
-                    "specific description. This does not prove that "
-                    "the scene is absent from the video."
+                st.caption(
+                    "This does not prove that the scene is absent. "
+                    "Try a different description. The threshold is "
+                    "a similarity filter, not a confidence probability."
                 )
 
             else:
-                st.success(
-                    f"Found {len(results)} matching moment(s) "
-                    f"that meet your threshold."
-                )
+                result = results[0]
+
+                st.success("A matching moment was found.")
 
                 st.caption(
-                    "Similarity scores measure visual resemblance, "
-                    "not the probability that a match is correct."
+                    f"Similarity: {result['score']:.3f} "
+                    f"(minimum required: {SIMILARITY_THRESHOLD:.2f})"
                 )
 
-                # Let the user choose which matching moment to play.
-                selected_index = st.selectbox(
-                    "Choose a matching moment to play",
-                    options=list(range(len(results))),
-                    format_func=lambda i: (
-                        f"Match {i + 1} — "
-                        f"{results[i]['timestamp']:.1f} seconds "
-                        f"(similarity {results[i]['score']:.3f})"
-                    ),
-                )
+                st.markdown("### Matching moment")
 
-                selected_result = results[selected_index]
-                match_timestamp = selected_result["timestamp"]
+                st.write(
+                    f"**Timestamp:** {result['timestamp']:.1f} seconds"
+                )
 
                 st.markdown("### Video playback")
 
-                st.caption(
-                    f"Starting playback at {match_timestamp:.1f} seconds "
-                    f"(similarity {selected_result['score']:.3f})."
-                )
-
-                # Play the original video from the selected match timestamp.
+                # Start playback near the matching timestamp.
                 st.video(
                     str(video_path),
-                    start_time=max(0, int(match_timestamp)),
+                    start_time=max(0, int(result["timestamp"])),
                 )
-
-                st.markdown("### Matching moments")
-
-                for i, result in enumerate(results, start=1):
-                    with st.container(border=True):
-                        col1, col2 = st.columns([2, 1])
-
-                        with col1:
-                            st.write(f"**Match {i}**")
-                            st.write(
-                                f"Timestamp: "
-                                f"{result['timestamp']:.1f} seconds"
-                            )
-
-                        with col2:
-                            st.metric(
-                                "Similarity",
-                                f"{result['score']:.3f}",
-                            )
 
 else:
     st.info("Upload a valid video to search its visual content.")
-
 
 
 # --------------------------------------------------
