@@ -7,9 +7,7 @@ import subprocess
 from pathlib import Path
 
 import cv2
-import faiss
 import open_clip
-import pandas as pd
 import streamlit as st
 import torch
 
@@ -21,12 +19,7 @@ from src.upload_pipeline import process_uploaded_video
 # --------------------------------------------------
 
 ROOT = Path(__file__).resolve().parent.parent
-ARTIFACTS_DIR = ROOT / "artifacts"
-VIDEO_DIR = ROOT / "data" / "videos"
 UPLOAD_DIR = ROOT / "data" / "uploads"
-
-INDEX_FILE = ARTIFACTS_DIR / "frames.faiss"
-METADATA_FILE = ARTIFACTS_DIR / "frame_metadata.csv"
 
 MODEL_NAME = "ViT-B-32"
 PRETRAINED = "laion2b_s34b_b79k"
@@ -36,7 +29,7 @@ ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "mkv", "webm"}
 
 
 # --------------------------------------------------
-# Streamlit page configuration
+# Streamlit configuration
 # --------------------------------------------------
 
 st.set_page_config(
@@ -46,10 +39,11 @@ st.set_page_config(
 )
 
 st.title("🎬 Multimodal Video Search")
+
 st.write(
-    "Search your indexed dataset or upload a video to extract frames, "
-    "generate visual embeddings, and prepare it for AI-powered "
-    "question answering."
+    "Upload your own video to inspect it, extract representative frames, "
+    "generate CLIP visual embeddings, and build a dedicated visual index. "
+    "Question answering will be added in a later stage."
 )
 
 
@@ -58,14 +52,14 @@ st.write(
 # --------------------------------------------------
 
 def save_uploaded_video(uploaded_file):
-    """Validate and save an uploaded video without overwriting others."""
+    """Validate and save an upload using a unique content-based filename."""
 
     original_name = Path(uploaded_file.name).name
     extension = Path(original_name).suffix.lower().lstrip(".")
 
     if extension not in ALLOWED_EXTENSIONS:
         raise ValueError(
-            f"Unsupported file extension: .{extension}. "
+            f"Unsupported extension: .{extension}. "
             f"Supported formats: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
         )
 
@@ -87,7 +81,6 @@ def save_uploaded_video(uploaded_file):
 
     saved_path = UPLOAD_DIR / f"{safe_stem}_{file_hash}.{extension}"
 
-    # Do not rewrite an identical upload.
     if not saved_path.exists():
         saved_path.write_bytes(file_bytes)
 
@@ -95,7 +88,7 @@ def save_uploaded_video(uploaded_file):
 
 
 def inspect_video(video_path):
-    """Read basic video properties and verify that a frame is decodable."""
+    """Inspect video metadata and verify that at least one frame decodes."""
 
     capture = cv2.VideoCapture(str(video_path))
 
@@ -103,7 +96,7 @@ def inspect_video(video_path):
         if not capture.isOpened():
             raise ValueError(
                 "OpenCV could not open this video. "
-                "It may be corrupt or use an unsupported codec."
+                "The file may be corrupt or use an unsupported codec."
             )
 
         width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -121,7 +114,7 @@ def inspect_video(video_path):
 
         if not readable:
             raise ValueError(
-                "The video opened, but OpenCV could not decode its first frame."
+                "The video opened, but its first frame could not be decoded."
             )
 
         return {
@@ -137,7 +130,7 @@ def inspect_video(video_path):
 
 
 def inspect_audio_stream(video_path):
-    """Return audio-track details if ffprobe is installed."""
+    """Inspect audio tracks using ffprobe when available."""
 
     ffprobe = shutil.which("ffprobe")
 
@@ -165,11 +158,10 @@ def inspect_audio_stream(video_path):
         )
 
         information = json.loads(completed.stdout)
-        streams = information.get("streams", [])
 
         return [
             stream
-            for stream in streams
+            for stream in information.get("streams", [])
             if stream.get("codec_type") == "audio"
         ]
 
@@ -182,39 +174,55 @@ def inspect_audio_stream(video_path):
 
 
 # --------------------------------------------------
-# Section 1: Upload and inspect a video
+# CLIP resources
 # --------------------------------------------------
 
-st.header("1. Upload and Inspect a Video")
+@st.cache_resource
+def load_clip_resources():
+    """Load the local CLIP model once and reuse it across Streamlit reruns."""
 
-st.write(
-    "Upload a video to preview it and inspect its technical properties. "
-    "You can then extract frames and build a separate visual index "
-    "for that video."
-)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model, _, image_preprocess = open_clip.create_model_and_transforms(
+        MODEL_NAME,
+        pretrained=PRETRAINED,
+        device=device,
+    )
+
+    model.eval()
+
+    return model, image_preprocess, device
+
+
+# --------------------------------------------------
+# Section 1: Upload and inspect
+# --------------------------------------------------
+
+st.header("1. Upload and Inspect Your Video")
 
 uploaded_file = st.file_uploader(
-    "Choose a video",
+    "Choose a video file",
     type=sorted(ALLOWED_EXTENSIONS),
-    help="Maximum upload size: 200 MiB.",
+    help="Maximum file size: 200 MiB.",
     key="video_upload",
 )
 
-# Always initialize the path. It remains None until saving succeeds.
 video_path = None
 video_info = None
 
-if uploaded_file is not None:
+if uploaded_file is None:
+    st.info("Upload a video to begin.")
+
+else:
     try:
-        # Save first. This fixes the previous None-path problem.
+        # Save the file before inspecting or previewing it.
         video_path = save_uploaded_video(uploaded_file)
 
-        # Inspect the actual saved file.
         video_info = inspect_video(video_path)
 
         st.success("Video uploaded and validated successfully.")
 
-        st.subheader("Video preview")
+        st.subheader("Video Preview")
         st.video(str(video_path))
 
         st.caption(f"Saved file: {video_path.name}")
@@ -239,7 +247,7 @@ if uploaded_file is not None:
 
         with col3:
             st.metric(
-                "Frame rate",
+                "Frame Rate",
                 f"{video_info['fps']:.2f} FPS"
                 if video_info["fps"] > 0
                 else "Unavailable",
@@ -254,7 +262,7 @@ if uploaded_file is not None:
         if audio_streams is None:
             st.info(
                 "Audio-track status could not be verified. "
-                "Install FFmpeg/ffprobe to inspect audio streams."
+                "Install FFmpeg to enable ffprobe audio inspection."
             )
 
         elif not audio_streams:
@@ -266,7 +274,8 @@ if uploaded_file is not None:
             )
 
             for track_number, track in enumerate(
-                audio_streams, start=1
+                audio_streams,
+                start=1,
             ):
                 st.caption(
                     f"Track {track_number}: "
@@ -285,146 +294,40 @@ st.divider()
 
 
 # --------------------------------------------------
-# Section 2: Load resources for dataset search
+# Section 2: Extract frames and build a visual index
 # --------------------------------------------------
 
-st.header("2. Search the Existing Dataset")
+st.header("2. Build Your Video's Visual Index")
 
-
-@st.cache_resource
-def load_resources():
-    """Load the CLIP model and dataset FAISS index once."""
-
-    if not INDEX_FILE.exists():
-        raise FileNotFoundError(
-            f"FAISS index not found: {INDEX_FILE}"
-        )
-
-    if not METADATA_FILE.exists():
-        raise FileNotFoundError(
-            f"Frame metadata not found: {METADATA_FILE}"
-        )
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    model, _, image_preprocess = open_clip.create_model_and_transforms(
-        MODEL_NAME,
-        pretrained=PRETRAINED,
-        device=device,
-    )
-
-    tokenizer = open_clip.get_tokenizer(MODEL_NAME)
-    model.eval()
-
-    index = faiss.read_index(str(INDEX_FILE))
-    metadata = pd.read_csv(METADATA_FILE)
-
-    if index.ntotal != len(metadata):
-        raise ValueError(
-            "FAISS index size does not match frame metadata."
-        )
-
-    if index.d != 512:
-        raise ValueError(
-            f"Expected 512-dimensional CLIP embeddings; got {index.d}."
-        )
-
-    return model, tokenizer, image_preprocess, device, index, metadata
-
-
-def encode_query(query, model, tokenizer, device):
-    """Encode and normalize a text query with CLIP."""
-
-    tokens = tokenizer([query]).to(device)
-
-    with torch.inference_mode():
-        features = model.encode_text(tokens)
-        features = features / features.norm(
-            dim=-1, keepdim=True
-        ).clamp_min(1e-12)
-
-    return features.float().cpu().numpy().astype("float32")
-
-
-def search_videos(
-    query,
-    model,
-    tokenizer,
-    device,
-    index,
-    metadata,
-    top_k,
-):
-    """Return the strongest matching frame for each dataset video."""
-
-    query_vector = encode_query(
-        query,
-        model,
-        tokenizer,
-        device,
-    )
-
-    scores, indices = index.search(query_vector, index.ntotal)
-
-    # FAISS may return -1 indices if fewer results are available.
-    valid = indices[0] >= 0
-
-    if not valid.any():
-        return pd.DataFrame()
-
-    results = metadata.iloc[indices[0][valid]].copy()
-    results["similarity"] = scores[0][valid]
-
-    best_frames = (
-        results.sort_values("similarity", ascending=False)
-        .drop_duplicates(subset="video_id")
-        .head(top_k)
-        .copy()
-    )
-
-    return best_frames.reset_index(drop=True)
-
-
-# Load the model once for both dataset search and uploaded-video processing.
-try:
-    (
-        model,
-        tokenizer,
-        image_preprocess,
-        device,
-        index,
-        metadata,
-    ) = load_resources()
-
-except Exception as exc:
-    st.error(f"Could not load search resources: {exc}")
-    st.stop()
-
-
-st.caption(
-    f"Model: {MODEL_NAME} | Device: {device} | "
-    f"Indexed dataset frames: {index.ntotal}"
+st.write(
+    "Sample frames from your uploaded video, encode them with CLIP, "
+    "and save a dedicated FAISS index. These visual embeddings will "
+    "support frame retrieval in a later question-answering stage."
 )
-
-
-# --------------------------------------------------
-# Section 3: Process the uploaded video
-# --------------------------------------------------
-
-st.divider()
-st.header("3. Process Uploaded Video")
 
 if video_path is not None and Path(video_path).is_file():
 
     interval_seconds = st.select_slider(
-        "Frame sampling interval",
+        "Frame sampling interval (seconds)",
         options=[1, 2, 3, 5, 10],
-        value=1,
+        value=2,
         help=(
-            "One second samples more frames and takes longer. "
-            "Larger intervals are faster but may miss brief events."
+            "A 1-second interval captures more visual detail but takes "
+            "longer. Larger intervals reduce processing time but can "
+            "miss brief events."
         ),
     )
+
+    if video_info and video_info["duration"] is not None:
+        estimated_frames = max(
+            1,
+            int(video_info["duration"] / interval_seconds),
+        )
+
+        st.caption(
+            f"Estimated sampling count: approximately "
+            f"{estimated_frames:,} frames before black-frame filtering."
+        )
 
     if st.button(
         "Extract Frames and Build Video Index",
@@ -432,9 +335,11 @@ if video_path is not None and Path(video_path).is_file():
     ):
         try:
             with st.spinner(
-                "Extracting frames, generating CLIP embeddings, "
-                "and building the FAISS index..."
+                "Loading CLIP and processing your video. "
+                "Long videos can take several minutes..."
             ):
+                model, image_preprocess, device = load_clip_resources()
+
                 processing_result = process_uploaded_video(
                     video_path=video_path,
                     model=model,
@@ -444,73 +349,69 @@ if video_path is not None and Path(video_path).is_file():
                     batch_size=32,
                 )
 
-            st.success("Uploaded video processed successfully.")
+            st.success("Video processing completed successfully.")
 
-            metric1, metric2, metric3 = st.columns(3)
+            col1, col2, col3 = st.columns(3)
 
-            metric1.metric(
-                "Frames extracted",
-                processing_result["frames_extracted"],
+            col1.metric(
+                "Frames Extracted",
+                f"{processing_result['frames_extracted']:,}",
             )
 
-            metric2.metric(
-                "Frames embedded",
-                processing_result["frames_embedded"],
+            col2.metric(
+                "Frames Embedded",
+                f"{processing_result['frames_embedded']:,}",
             )
 
-            metric3.metric(
-                "Embedding dimensions",
+            col3.metric(
+                "Embedding Dimensions",
                 processing_result["embedding_shape"][1],
             )
 
+            st.subheader("Processing Details")
+
             st.write(
-                "**Video:**",
-                processing_result["video_name"],
+                f"**Video:** {processing_result['video_name']}"
             )
 
             st.write(
-                "**Processing device:**",
-                processing_result["device"],
+                f"**Processing device:** {processing_result['device']}"
+            )
+
+            st.write(
+                f"**Sampling interval:** {interval_seconds} second(s)"
             )
 
             if processing_result["duration_seconds"] is not None:
                 st.write(
-                    "**Duration:**",
-                    f"{processing_result['duration_seconds']:.2f} seconds",
+                    f"**Duration:** "
+                    f"{processing_result['duration_seconds']:.2f} seconds"
                 )
 
             st.write(
-                "**Frame manifest:**",
-                str(
-                    processing_result["manifest_path"].relative_to(ROOT)
-                ),
+                "**Frame manifest:** "
+                f"`{processing_result['manifest_path'].relative_to(ROOT)}`"
             )
 
             st.write(
-                "**Frame embeddings:**",
-                str(
-                    processing_result["embeddings_path"].relative_to(ROOT)
-                ),
+                "**Embeddings:** "
+                f"`{processing_result['embeddings_path'].relative_to(ROOT)}`"
             )
 
             st.write(
-                "**Frame metadata:**",
-                str(
-                    processing_result["metadata_path"].relative_to(ROOT)
-                ),
+                "**Frame metadata:** "
+                f"`{processing_result['metadata_path'].relative_to(ROOT)}`"
             )
 
             st.write(
-                "**FAISS index:**",
-                str(
-                    processing_result["index_path"].relative_to(ROOT)
-                ),
+                "**FAISS index:** "
+                f"`{processing_result['index_path'].relative_to(ROOT)}`"
             )
 
             st.info(
-                "Processing is complete. The uploaded video's visual "
-                "index is ready for the next stage: retrieving relevant "
-                "frames to answer questions."
+                "The uploaded video's visual index is ready. "
+                "Natural-language frame retrieval and local video "
+                "question answering are not implemented yet."
             )
 
         except Exception as exc:
@@ -523,109 +424,12 @@ else:
 
 
 # --------------------------------------------------
-# Section 4: Search the existing MSR-VTT dataset
+# Footer
 # --------------------------------------------------
 
 st.divider()
-st.header("4. Search the Existing Dataset")
 
-with st.form("search_form"):
-    query = st.text_input(
-        "Describe the scene you want to find",
-        placeholder="e.g. a person playing guitar",
-    )
-
-    top_k = st.slider(
-        "Number of video results",
-        min_value=1,
-        max_value=10,
-        value=5,
-    )
-
-    submitted = st.form_submit_button("Search videos")
-
-
-if submitted:
-    if not query.strip():
-        st.warning("Enter a description before searching.")
-
-    else:
-        with st.spinner("Searching video frames..."):
-            results = search_videos(
-                query.strip(),
-                model,
-                tokenizer,
-                device,
-                index,
-                metadata,
-                top_k,
-            )
-
-        st.subheader(f"Results for: {query.strip()}")
-
-        if results.empty:
-            st.info("No results were found.")
-
-        else:
-            for rank, (_, row) in enumerate(
-                results.iterrows(),
-                start=1,
-            ):
-                frame_path = ROOT / str(row["frame_path"])
-
-                video_path_result = VIDEO_DIR / Path(
-                    str(row["video"])
-                ).name
-
-                timestamp = max(
-                    0.0,
-                    float(row["timestamp_seconds"]),
-                )
-
-                with st.container(border=True):
-                    left, right = st.columns([1, 2])
-
-                    with left:
-                        st.markdown(f"### Result #{rank}")
-
-                        if frame_path.is_file():
-                            st.image(
-                                str(frame_path),
-                                caption=(
-                                    f"Matching frame: {timestamp:.1f}s"
-                                ),
-                                use_container_width=True,
-                            )
-
-                        else:
-                            st.warning("Preview frame not found.")
-
-                    with right:
-                        st.markdown(
-                            f"**Video:** `{row['video']}`"
-                        )
-
-                        st.metric(
-                            "Cosine similarity",
-                            f"{row['similarity']:.4f}",
-                        )
-
-                        st.write(
-                            f"**Best timestamp:** {timestamp:.1f} seconds"
-                        )
-
-                        st.caption(
-                            "Similarity is a ranking score, not a probability."
-                        )
-
-                    with st.expander("▶ Play matching video"):
-                        if video_path_result.is_file():
-                            st.video(
-                                str(video_path_result),
-                                start_time=int(timestamp),
-                            )
-
-                        else:
-                            st.warning(
-                                "Original dataset video not found."
-                            )
+st.caption(
+    f"Visual encoder: OpenCLIP {MODEL_NAME} | "
+    f"Pretrained weights: {PRETRAINED}"
+)
