@@ -7,7 +7,10 @@ import subprocess
 from pathlib import Path
 
 import cv2
+import faiss
+import numpy as np
 import open_clip
+import pandas as pd
 import streamlit as st
 import torch
 
@@ -41,8 +44,8 @@ st.set_page_config(
 st.title("🎬 Multimodal Video Search")
 
 st.write(
-    "Upload a video to prepare it for visual search. "
-    "The app extracts representative frames and creates a visual index."
+    "Upload a video, prepare its visual index, and search "
+    "for scenes using natural-language descriptions."
 )
 
 
@@ -51,7 +54,7 @@ st.write(
 # --------------------------------------------------
 
 def save_uploaded_video(uploaded_file):
-    """Validate and save an upload using a unique content-based filename."""
+    """Validate and save an upload using a content-based filename."""
 
     original_name = Path(uploaded_file.name).name
     extension = Path(original_name).suffix.lower().lstrip(".")
@@ -193,11 +196,25 @@ def load_clip_resources():
     return model, image_preprocess, device
 
 
+@st.cache_resource
+def load_clip_tokenizer():
+    """Load the tokenizer used by the CLIP text encoder."""
+
+    return open_clip.get_tokenizer(MODEL_NAME)
+
+
 # --------------------------------------------------
 # Progress reporting
 # --------------------------------------------------
 
-def update_processing_progress(progress_bar, status, stage, current, total, message):
+def update_processing_progress(
+    progress_bar,
+    status,
+    stage,
+    current,
+    total,
+    message,
+):
     """Update a single progress bar from pipeline stage updates."""
 
     fraction = min(max(current / max(total, 1), 0.0), 1.0)
@@ -218,7 +235,6 @@ def update_processing_progress(progress_bar, status, stage, current, total, mess
         text="Preparing your video for visual search...",
     )
 
-    # Keep the stage message short; do not show internal paths or filenames.
     friendly_messages = {
         "extract": "Extracting representative frames...",
         "preprocess": "Preparing video frames...",
@@ -228,6 +244,83 @@ def update_processing_progress(progress_bar, status, stage, current, total, mess
     }
 
     status.caption(friendly_messages.get(stage, "Processing video..."))
+
+
+# --------------------------------------------------
+# Visual search helpers
+# --------------------------------------------------
+
+def search_video_frames(query, top_k, index_path, metadata_path):
+    """Find frames most similar to a natural-language description."""
+
+    if not query.strip():
+        raise ValueError("Enter a description before searching.")
+
+    if not index_path.is_file() or not metadata_path.is_file():
+        raise FileNotFoundError(
+            "The visual index is not available. Process the video first."
+        )
+
+    model, _, device = load_clip_resources()
+    tokenizer = load_clip_tokenizer()
+
+    tokens = tokenizer([query.strip()]).to(device)
+
+    with torch.inference_mode():
+        text_features = model.encode_text(tokens)
+
+        text_features = text_features / text_features.norm(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1e-12)
+
+    query_embedding = (
+        text_features.float()
+        .cpu()
+        .numpy()
+        .astype(np.float32)
+    )
+
+    index = faiss.read_index(str(index_path))
+    metadata = pd.read_csv(metadata_path)
+
+    if index.ntotal != len(metadata):
+        raise ValueError(
+            "The visual index and frame metadata do not match. "
+            "Please process the video again."
+        )
+
+    if index.ntotal == 0:
+        raise ValueError("No indexed frames are available to search.")
+
+    result_count = min(int(top_k), index.ntotal)
+
+    scores, indices = index.search(query_embedding, result_count)
+
+    results = []
+
+    for score, row_index in zip(scores[0], indices[0]):
+        if row_index < 0:
+            continue
+
+        row = metadata.iloc[int(row_index)]
+
+        frame_path = ROOT / str(row["frame_path"])
+
+        if not frame_path.is_file():
+            continue
+
+        timestamp = float(row["timestamp_seconds"])
+
+        results.append(
+            {
+                "path": frame_path,
+                "timestamp": timestamp,
+                "score": float(score),
+            }
+        )
+
+    return results
 
 
 # --------------------------------------------------
@@ -289,10 +382,8 @@ else:
 
         if audio_streams is None:
             st.caption("Audio-track information is unavailable.")
-
         elif not audio_streams:
             st.caption("No audio track detected.")
-
         else:
             st.caption("Audio track detected.")
 
@@ -317,17 +408,22 @@ if video_path is not None and Path(video_path).is_file():
         "Frame sampling interval",
         options=[1, 2, 3, 5, 10],
         value=2,
-        format_func=lambda value: f"Every {value} second"
-        if value == 1
-        else f"Every {value} seconds",
+        format_func=lambda value: (
+            f"Every {value} second"
+            if value == 1
+            else f"Every {value} seconds"
+        ),
         help=(
             "Smaller intervals capture more detail but take longer. "
             "Larger intervals are faster but may miss brief events."
         ),
     )
 
-    if st.button("Process Video", type="primary", use_container_width=True):
-
+    if st.button(
+        "Process Video",
+        type="primary",
+        use_container_width=True,
+    ):
         progress_bar = st.progress(
             0,
             text="Starting video processing...",
@@ -371,8 +467,219 @@ if video_path is not None and Path(video_path).is_file():
             status.empty()
             st.error(f"Video processing failed: {exc}")
 
+
 else:
     st.info("Upload a valid video to continue.")
+
+
+# --------------------------------------------------
+# Section 3: Search video using text
+# --------------------------------------------------
+
+
+# --------------------------------------------------
+# Section 3: Search and play matching video moments
+# --------------------------------------------------
+
+st.divider()
+st.header("3. Search Your Video")
+
+if video_path is not None and Path(video_path).is_file():
+
+    upload_id = Path(video_path).stem.rsplit("_", 1)[-1]
+    artifact_dir = ROOT / "artifacts" / "uploaded" / upload_id
+
+    index_path = artifact_dir / "frames.faiss"
+    metadata_path = artifact_dir / "frame_metadata.csv"
+
+    if not index_path.is_file() or not metadata_path.is_file():
+        st.info(
+            "Process this video first. After processing, "
+            "you can search and play matching moments."
+        )
+
+    else:
+        st.write(
+            "Describe a scene, object, person, or activity. "
+            "The app will find matching moments in your video."
+        )
+
+        with st.form("visual_search_form"):
+            query = st.text_input(
+                "What do you want to find?",
+                placeholder="e.g. a person walking through a room",
+            )
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                top_k = st.slider(
+                    "Maximum candidate matches",
+                    min_value=1,
+                    max_value=20,
+                    value=10,
+                )
+
+            with col2:
+                similarity_threshold = st.slider(
+                    "Minimum similarity threshold",
+                    min_value=0.05,
+                    max_value=0.50,
+                    value=0.20,
+                    step=0.01,
+                    format="%.2f",
+                    help=(
+                        "Only matches with a similarity score at or "
+                        "above this value will be shown. Higher values "
+                        "are stricter, but may exclude relevant scenes."
+                    ),
+                )
+
+            submitted = st.form_submit_button(
+                "Search Video",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if submitted:
+            # Clear old results so a failed search cannot show stale matches.
+            st.session_state.pop("visual_search_results", None)
+
+            if not query.strip():
+                st.warning("Enter a description before searching.")
+
+            else:
+                try:
+                    with st.spinner("Searching for matching moments..."):
+                        candidates = search_video_frames(
+                            query=query,
+                            top_k=top_k,
+                            index_path=index_path,
+                            metadata_path=metadata_path,
+                        )
+
+                    matching_results = [
+                        result
+                        for result in candidates
+                        if result["score"] >= similarity_threshold
+                    ]
+
+                    st.session_state["visual_search_results"] = {
+                        "upload_id": upload_id,
+                        "query": query.strip(),
+                        "threshold": similarity_threshold,
+                        "results": matching_results,
+                        "best_score": (
+                            candidates[0]["score"]
+                            if candidates
+                            else None
+                        ),
+                    }
+
+                except Exception as exc:
+                    st.error(
+                        "Search failed. Please check that the video "
+                        f"has been processed. Details: {exc}"
+                    )
+
+        saved_results = st.session_state.get("visual_search_results")
+
+        if (
+            saved_results
+            and saved_results["upload_id"] == upload_id
+        ):
+            results = saved_results["results"]
+            threshold = saved_results["threshold"]
+
+            st.subheader(
+                f'Search results for "{saved_results["query"]}"'
+            )
+
+            st.caption(
+                f"Minimum similarity: {threshold:.2f}"
+            )
+
+            if not results:
+                best_score = saved_results["best_score"]
+
+                st.warning(
+                    "No sufficiently similar moments were found "
+                    "among the retrieved candidates."
+                )
+
+                if best_score is not None:
+                    st.write(
+                        f"The strongest candidate scored "
+                        f"{best_score:.3f}, below your threshold "
+                        f"of {threshold:.2f}."
+                    )
+
+                st.write(
+                    "Try lowering the threshold or using a more "
+                    "specific description. This does not prove that "
+                    "the scene is absent from the video."
+                )
+
+            else:
+                st.success(
+                    f"Found {len(results)} matching moment(s) "
+                    f"that meet your threshold."
+                )
+
+                st.caption(
+                    "Similarity scores measure visual resemblance, "
+                    "not the probability that a match is correct."
+                )
+
+                # Let the user choose which matching moment to play.
+                selected_index = st.selectbox(
+                    "Choose a matching moment to play",
+                    options=list(range(len(results))),
+                    format_func=lambda i: (
+                        f"Match {i + 1} — "
+                        f"{results[i]['timestamp']:.1f} seconds "
+                        f"(similarity {results[i]['score']:.3f})"
+                    ),
+                )
+
+                selected_result = results[selected_index]
+                match_timestamp = selected_result["timestamp"]
+
+                st.markdown("### Video playback")
+
+                st.caption(
+                    f"Starting playback at {match_timestamp:.1f} seconds "
+                    f"(similarity {selected_result['score']:.3f})."
+                )
+
+                # Play the original video from the selected match timestamp.
+                st.video(
+                    str(video_path),
+                    start_time=max(0, int(match_timestamp)),
+                )
+
+                st.markdown("### Matching moments")
+
+                for i, result in enumerate(results, start=1):
+                    with st.container(border=True):
+                        col1, col2 = st.columns([2, 1])
+
+                        with col1:
+                            st.write(f"**Match {i}**")
+                            st.write(
+                                f"Timestamp: "
+                                f"{result['timestamp']:.1f} seconds"
+                            )
+
+                        with col2:
+                            st.metric(
+                                "Similarity",
+                                f"{result['score']:.3f}",
+                            )
+
+else:
+    st.info("Upload a valid video to search its visual content.")
+
 
 
 # --------------------------------------------------
@@ -380,5 +687,4 @@ else:
 # --------------------------------------------------
 
 st.divider()
-
 st.caption("Powered by OpenCLIP")
