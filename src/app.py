@@ -41,9 +41,8 @@ st.set_page_config(
 st.title("🎬 Multimodal Video Search")
 
 st.write(
-    "Upload your own video to inspect it, extract representative frames, "
-    "generate CLIP visual embeddings, and build a dedicated visual index. "
-    "Question answering will be added in a later stage."
+    "Upload a video to prepare it for visual search. "
+    "The app extracts representative frames and creates a visual index."
 )
 
 
@@ -179,7 +178,7 @@ def inspect_audio_stream(video_path):
 
 @st.cache_resource
 def load_clip_resources():
-    """Load the local CLIP model once and reuse it across Streamlit reruns."""
+    """Load CLIP once and reuse it across Streamlit reruns."""
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -195,10 +194,47 @@ def load_clip_resources():
 
 
 # --------------------------------------------------
+# Progress reporting
+# --------------------------------------------------
+
+def update_processing_progress(progress_bar, status, stage, current, total, message):
+    """Update a single progress bar from pipeline stage updates."""
+
+    fraction = min(max(current / max(total, 1), 0.0), 1.0)
+
+    stage_ranges = {
+        "extract": (0.0, 0.45),
+        "preprocess": (0.45, 0.60),
+        "embed": (0.60, 0.95),
+        "index": (0.95, 0.99),
+        "done": (1.0, 1.0),
+    }
+
+    start, end = stage_ranges.get(stage, (0.0, 0.0))
+    progress = start + (end - start) * fraction
+
+    progress_bar.progress(
+        min(progress, 1.0),
+        text="Preparing your video for visual search...",
+    )
+
+    # Keep the stage message short; do not show internal paths or filenames.
+    friendly_messages = {
+        "extract": "Extracting representative frames...",
+        "preprocess": "Preparing video frames...",
+        "embed": "Analyzing frames with AI...",
+        "index": "Finishing up...",
+        "done": "Complete",
+    }
+
+    status.caption(friendly_messages.get(stage, "Processing video..."))
+
+
+# --------------------------------------------------
 # Section 1: Upload and inspect
 # --------------------------------------------------
 
-st.header("1. Upload and Inspect Your Video")
+st.header("1. Upload Your Video")
 
 uploaded_file = st.file_uploader(
     "Choose a video file",
@@ -211,21 +247,17 @@ video_path = None
 video_info = None
 
 if uploaded_file is None:
-    st.info("Upload a video to begin.")
+    st.info("Upload a video to get started.")
 
 else:
     try:
-        # Save the file before inspecting or previewing it.
         video_path = save_uploaded_video(uploaded_file)
-
         video_info = inspect_video(video_path)
 
-        st.success("Video uploaded and validated successfully.")
+        st.success("Video uploaded successfully.")
 
         st.subheader("Video Preview")
         st.video(str(video_path))
-
-        st.caption(f"Saved file: {video_path.name}")
 
         col1, col2, col3 = st.columns(3)
 
@@ -240,7 +272,7 @@ else:
 
             st.metric(
                 "Duration",
-                f"{duration:.2f} seconds"
+                f"{duration:.1f} seconds"
                 if duration is not None
                 else "Unavailable",
             )
@@ -253,36 +285,16 @@ else:
                 else "Unavailable",
             )
 
-        st.write(
-            f"**Decoded frame count:** {video_info['frame_count']}"
-        )
-
         audio_streams = inspect_audio_stream(video_path)
 
         if audio_streams is None:
-            st.info(
-                "Audio-track status could not be verified. "
-                "Install FFmpeg to enable ffprobe audio inspection."
-            )
+            st.caption("Audio-track information is unavailable.")
 
         elif not audio_streams:
-            st.warning("No audio stream was detected in this video.")
+            st.caption("No audio track detected.")
 
         else:
-            st.success(
-                f"Audio stream detected: {len(audio_streams)} track(s)."
-            )
-
-            for track_number, track in enumerate(
-                audio_streams,
-                start=1,
-            ):
-                st.caption(
-                    f"Track {track_number}: "
-                    f"{track.get('codec_name', 'unknown codec')}, "
-                    f"{track.get('sample_rate', 'unknown')} Hz, "
-                    f"{track.get('channels', 'unknown')} channel(s)"
-                )
+            st.caption("Audio track detected.")
 
     except (ValueError, OSError) as exc:
         video_path = None
@@ -294,133 +306,73 @@ st.divider()
 
 
 # --------------------------------------------------
-# Section 2: Extract frames and build a visual index
+# Section 2: Process video
 # --------------------------------------------------
 
-st.header("2. Build Your Video's Visual Index")
-
-st.write(
-    "Sample frames from your uploaded video, encode them with CLIP, "
-    "and save a dedicated FAISS index. These visual embeddings will "
-    "support frame retrieval in a later question-answering stage."
-)
+st.header("2. Prepare for Visual Search")
 
 if video_path is not None and Path(video_path).is_file():
 
     interval_seconds = st.select_slider(
-        "Frame sampling interval (seconds)",
+        "Frame sampling interval",
         options=[1, 2, 3, 5, 10],
         value=2,
+        format_func=lambda value: f"Every {value} second"
+        if value == 1
+        else f"Every {value} seconds",
         help=(
-            "A 1-second interval captures more visual detail but takes "
-            "longer. Larger intervals reduce processing time but can "
-            "miss brief events."
+            "Smaller intervals capture more detail but take longer. "
+            "Larger intervals are faster but may miss brief events."
         ),
     )
 
-    if video_info and video_info["duration"] is not None:
-        estimated_frames = max(
-            1,
-            int(video_info["duration"] / interval_seconds),
-        )
+    if st.button("Process Video", type="primary", use_container_width=True):
 
-        st.caption(
-            f"Estimated sampling count: approximately "
-            f"{estimated_frames:,} frames before black-frame filtering."
+        progress_bar = st.progress(
+            0,
+            text="Starting video processing...",
         )
+        status = st.empty()
 
-    if st.button(
-        "Extract Frames and Build Video Index",
-        type="primary",
-    ):
+        def progress_callback(stage, current, total, message):
+            update_processing_progress(
+                progress_bar,
+                status,
+                stage,
+                current,
+                total,
+                message,
+            )
+
         try:
-            with st.spinner(
-                "Loading CLIP and processing your video. "
-                "Long videos can take several minutes..."
-            ):
+            with st.spinner("Loading AI model..."):
                 model, image_preprocess, device = load_clip_resources()
 
-                processing_result = process_uploaded_video(
-                    video_path=video_path,
-                    model=model,
-                    preprocess=image_preprocess,
-                    device=device,
-                    interval_seconds=int(interval_seconds),
-                    batch_size=32,
-                )
-
-            st.success("Video processing completed successfully.")
-
-            col1, col2, col3 = st.columns(3)
-
-            col1.metric(
-                "Frames Extracted",
-                f"{processing_result['frames_extracted']:,}",
+            process_uploaded_video(
+                video_path=video_path,
+                model=model,
+                preprocess=image_preprocess,
+                device=device,
+                interval_seconds=int(interval_seconds),
+                batch_size=32,
+                progress_callback=progress_callback,
             )
 
-            col2.metric(
-                "Frames Embedded",
-                f"{processing_result['frames_embedded']:,}",
+            progress_bar.progress(
+                1.0,
+                text="Video processing complete.",
             )
+            status.empty()
 
-            col3.metric(
-                "Embedding Dimensions",
-                processing_result["embedding_shape"][1],
-            )
-
-            st.subheader("Processing Details")
-
-            st.write(
-                f"**Video:** {processing_result['video_name']}"
-            )
-
-            st.write(
-                f"**Processing device:** {processing_result['device']}"
-            )
-
-            st.write(
-                f"**Sampling interval:** {interval_seconds} second(s)"
-            )
-
-            if processing_result["duration_seconds"] is not None:
-                st.write(
-                    f"**Duration:** "
-                    f"{processing_result['duration_seconds']:.2f} seconds"
-                )
-
-            st.write(
-                "**Frame manifest:** "
-                f"`{processing_result['manifest_path'].relative_to(ROOT)}`"
-            )
-
-            st.write(
-                "**Embeddings:** "
-                f"`{processing_result['embeddings_path'].relative_to(ROOT)}`"
-            )
-
-            st.write(
-                "**Frame metadata:** "
-                f"`{processing_result['metadata_path'].relative_to(ROOT)}`"
-            )
-
-            st.write(
-                "**FAISS index:** "
-                f"`{processing_result['index_path'].relative_to(ROOT)}`"
-            )
-
-            st.info(
-                "The uploaded video's visual index is ready. "
-                "Natural-language frame retrieval and local video "
-                "question answering are not implemented yet."
-            )
+            st.success("Your video is ready for visual search.")
 
         except Exception as exc:
+            progress_bar.empty()
+            status.empty()
             st.error(f"Video processing failed: {exc}")
 
 else:
-    st.info(
-        "Upload and validate a video in Section 1 to enable processing."
-    )
+    st.info("Upload a valid video to continue.")
 
 
 # --------------------------------------------------
@@ -429,7 +381,4 @@ else:
 
 st.divider()
 
-st.caption(
-    f"Visual encoder: OpenCLIP {MODEL_NAME} | "
-    f"Pretrained weights: {PRETRAINED}"
-)
+st.caption("Powered by OpenCLIP")
