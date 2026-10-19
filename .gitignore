@@ -1,0 +1,44 @@
+
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Downloaded source videos and extracted frames
+data/videos/*
+!data/videos/.gitkeep
+data/frames/*
+!data/frames/.gitkeep
+
+# Generated indexes, embeddings, and metadata
+artifacts/*
+!artifacts/.gitkeep
+
+# Logs and temporary files
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# IDE-specific settings
+.vscode/
+.idea/
