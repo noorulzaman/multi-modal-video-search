@@ -58,3 +58,6 @@ data/processed/*
 # Uploaded-video embeddings and FAISS indexes
 artifacts/uploaded/*
 !artifacts/uploaded/.gitkeep
+
+data/processed/*
+!data/processed/.gitkeep
