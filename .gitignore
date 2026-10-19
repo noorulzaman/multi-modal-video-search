@@ -50,3 +50,11 @@ MSRVTT_Videos.zip
 # User-uploaded videos
 data/uploads/*
 !data/uploads/.gitkeep
+
+# Processed uploaded-video frames
+data/processed/*
+!data/processed/.gitkeep
+
+# Uploaded-video embeddings and FAISS indexes
+artifacts/uploaded/*
+!artifacts/uploaded/.gitkeep
