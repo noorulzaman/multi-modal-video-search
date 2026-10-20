@@ -15,6 +15,8 @@ import streamlit as st
 import torch
 
 from src.upload_pipeline import process_uploaded_video
+from src.query_corrector import correct_query
+from src.search import SIMILARITY_THRESHOLD, evaluate_best_match
 
 
 # --------------------------------------------------
@@ -30,8 +32,9 @@ PRETRAINED = "laion2b_s34b_b79k"
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "mkv", "webm"}
 
+# Search settings. These are internal settings, not UI controls.
+CANDIDATE_RETRIEVAL_COUNT = 20
 MAX_CANDIDATE_MATCHES = 1
-SIMILARITY_THRESHOLD = 0.25
 
 
 # --------------------------------------------------
@@ -92,6 +95,26 @@ def save_uploaded_video(uploaded_file):
     return saved_path
 
 
+def get_saved_upload_path(uploaded_file):
+    """
+    Save an upload once per browser session.
+
+    Streamlit reruns the script on every interaction, so without this
+    each search would re-read and re-hash the whole video.
+    """
+
+    saved_uploads = st.session_state.setdefault("saved_uploads", {})
+    saved_path = saved_uploads.get(uploaded_file.file_id)
+
+    if saved_path is None or not saved_path.is_file():
+        saved_path = save_uploaded_video(uploaded_file)
+        saved_uploads[uploaded_file.file_id] = saved_path
+
+    return saved_path
+
+
+# Saved filenames include a content hash, so the path is a safe cache key.
+@st.cache_data(show_spinner=False)
 def inspect_video(video_path):
     """Inspect video metadata and verify that at least one frame decodes."""
 
@@ -134,6 +157,7 @@ def inspect_video(video_path):
         capture.release()
 
 
+@st.cache_data(show_spinner=False)
 def inspect_audio_stream(video_path):
     """Inspect audio tracks using ffprobe when available."""
 
@@ -218,7 +242,7 @@ def update_processing_progress(
     total,
     message,
 ):
-    """Update a single progress bar from pipeline stage updates."""
+    """Update the progress bar from pipeline stage updates."""
 
     fraction = min(max(current / max(total, 1), 0.0), 1.0)
 
@@ -254,7 +278,7 @@ def update_processing_progress(
 # --------------------------------------------------
 
 def search_video_frames(query, top_k, index_path, metadata_path):
-    """Find frames most similar to a natural-language description."""
+    """Retrieve the highest-scoring frames for a corrected text query."""
 
     if not query.strip():
         raise ValueError("Enter a description before searching.")
@@ -296,8 +320,13 @@ def search_video_frames(query, top_k, index_path, metadata_path):
     if index.ntotal == 0:
         raise ValueError("No indexed frames are available to search.")
 
-    result_count = min(int(top_k), index.ntotal)
+    if index.d != query_embedding.shape[1]:
+        raise ValueError(
+            "This video was indexed with a different CLIP model. "
+            "Please process the video again."
+        )
 
+    result_count = min(int(top_k), index.ntotal)
     scores, indices = index.search(query_embedding, result_count)
 
     results = []
@@ -344,14 +373,12 @@ if uploaded_file is None:
 
 else:
     try:
-        video_path = save_uploaded_video(uploaded_file)
+        video_path = get_saved_upload_path(uploaded_file)
         video_info = inspect_video(video_path)
 
         st.success("Video uploaded successfully.")
-
         st.subheader("Video Preview")
 
-        # Display the video preview in a narrower column.
         preview_col, _ = st.columns([1, 2])
 
         with preview_col:
@@ -454,6 +481,7 @@ if video_path is not None and Path(video_path).is_file():
                 model=model,
                 preprocess=image_preprocess,
                 device=device,
+                embedding_dim=model.visual.output_dim,
                 interval_seconds=int(interval_seconds),
                 batch_size=32,
                 progress_callback=progress_callback,
@@ -516,7 +544,7 @@ if video_path is not None and Path(video_path).is_file():
             )
 
         if submitted:
-            # Clear previous results to prevent stale results being shown.
+            # Clear previous results so a failed search cannot show stale data.
             st.session_state.pop("visual_search_results", None)
 
             if not query.strip():
@@ -524,34 +552,42 @@ if video_path is not None and Path(video_path).is_file():
 
             else:
                 try:
-                    with st.spinner("Searching for a matching moment..."):
+                    # Correct the user's prompt before CLIP text encoding.
+                    with st.spinner(
+                        "Correcting your query and searching video frames..."
+                    ):
+                        corrected_query = correct_query(query)
+
+                        if not corrected_query.strip():
+                            raise ValueError(
+                                "The query became empty after correction."
+                            )
+
                         candidates = search_video_frames(
-                            query=query,
-                            top_k=MAX_CANDIDATE_MATCHES,
+                            query=corrected_query,
+                            top_k=CANDIDATE_RETRIEVAL_COUNT,
                             index_path=index_path,
                             metadata_path=metadata_path,
                         )
 
-                    best_match = candidates[0] if candidates else None
+                    evaluation = evaluate_best_match(candidates)
+                    best_match = evaluation["best_match"]
 
                     matching_results = (
                         [best_match]
-                        if (
-                            best_match is not None
-                            and best_match["score"] >= SIMILARITY_THRESHOLD
-                        )
+                        if evaluation["accepted"] and best_match is not None
                         else []
-                    )
+                    )[:MAX_CANDIDATE_MATCHES]
 
                     st.session_state["visual_search_results"] = {
                         "upload_id": upload_id,
-                        "query": query.strip(),
+                        "original_query": query.strip(),
+                        "corrected_query": corrected_query,
                         "results": matching_results,
-                        "best_score": (
-                            best_match["score"]
-                            if best_match is not None
-                            else None
-                        ),
+                        "best_score": evaluation["best_score"],
+                        "competitor_score": evaluation["competitor_score"],
+                        "score_margin": evaluation["score_margin"],
+                        "reason": evaluation["reason"],
                     }
 
                 except Exception as exc:
@@ -562,35 +598,47 @@ if video_path is not None and Path(video_path).is_file():
 
         saved_results = st.session_state.get("visual_search_results")
 
-        if (
-            saved_results
-            and saved_results["upload_id"] == upload_id
-        ):
+        if saved_results and saved_results["upload_id"] == upload_id:
             results = saved_results["results"]
 
             st.subheader(
-                f'Results for "{saved_results["query"]}"'
+                f'Results for "{saved_results["original_query"]}"'
             )
 
-            if not results:
-                best_score = saved_results["best_score"]
+            original_query = saved_results["original_query"]
+            corrected_query = saved_results["corrected_query"]
 
-                st.warning(
-                    "No sufficiently similar match was found. "
-                    "The strongest candidate did not meet the "
-                    "required similarity threshold."
-                )
+            if original_query != corrected_query:
+                st.info(f"**Corrected query:** {corrected_query}")
+            else:
+                st.caption("No spelling or grammar corrections were needed.")
+
+            best_score = saved_results["best_score"]
+            competitor_score = saved_results["competitor_score"]
+            score_margin = saved_results["score_margin"]
+
+            if not results:
+                st.warning("No sufficiently reliable match was accepted.")
+
+                st.write(saved_results["reason"])
 
                 if best_score is not None:
                     st.write(
                         f"Best candidate similarity: {best_score:.3f}. "
-                        f"Required minimum: {SIMILARITY_THRESHOLD:.2f}."
+                        f"Minimum required: {SIMILARITY_THRESHOLD:.2f}."
+                    )
+
+                if competitor_score is not None and score_margin is not None:
+                    st.write(
+                        f"Distinct-time competitor similarity: "
+                        f"{competitor_score:.3f}. "
+                        f"Score margin: {score_margin:.3f}."
                     )
 
                 st.caption(
                     "This does not prove that the scene is absent. "
-                    "Try a different description. The threshold is "
-                    "a similarity filter, not a confidence probability."
+                    "Try a more specific description. Similarity scores "
+                    "and margins are heuristic signals, not probabilities."
                 )
 
             else:
@@ -600,8 +648,18 @@ if video_path is not None and Path(video_path).is_file():
 
                 st.caption(
                     f"Similarity: {result['score']:.3f} "
-                    f"(minimum required: {SIMILARITY_THRESHOLD:.2f})"
+                    f"(minimum: {SIMILARITY_THRESHOLD:.2f})"
                 )
+
+                if competitor_score is not None and score_margin is not None:
+                    st.caption(
+                        f"Distinct-time score margin: {score_margin:.3f}"
+                    )
+                else:
+                    st.caption(
+                        "No sufficiently separated competitor was available "
+                        "to calculate a score margin."
+                    )
 
                 st.markdown("### Matching moment")
 
@@ -611,7 +669,6 @@ if video_path is not None and Path(video_path).is_file():
 
                 st.markdown("### Video playback")
 
-                # Start playback near the matching timestamp.
                 st.video(
                     str(video_path),
                     start_time=max(0, int(result["timestamp"])),
@@ -626,4 +683,4 @@ else:
 # --------------------------------------------------
 
 st.divider()
-st.caption("Powered by OpenCLIP")
+st.caption("Powered by OpenCLIP with spelling and grammar correction")

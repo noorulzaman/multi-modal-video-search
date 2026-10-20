@@ -1,7 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-import shutil
-import threading
 
 import cv2
 import faiss
@@ -228,11 +226,17 @@ def embed_frames(
 
 
 
-def build_faiss_index(embeddings):
+def build_faiss_index(embeddings, expected_dim=None):
     """Build an exact cosine-similarity index from normalized embeddings."""
-    if embeddings.ndim != 2 or embeddings.shape[1] != 512:
+    if embeddings.ndim != 2 or embeddings.shape[1] == 0:
         raise ValueError(
-            f"Expected embeddings with shape (N, 512), received {embeddings.shape}."
+            f"Expected a non-empty 2-D embedding matrix, received {embeddings.shape}."
+        )
+
+    if expected_dim is not None and embeddings.shape[1] != expected_dim:
+        raise ValueError(
+            f"Expected embeddings with shape (N, {expected_dim}), "
+            f"received {embeddings.shape}."
         )
 
     if not np.isfinite(embeddings).all():
@@ -252,6 +256,7 @@ def process_uploaded_video(
     model,
     preprocess,
     device,
+    embedding_dim=None,
     interval_seconds=1,
     batch_size=32,
     progress_callback=None,
@@ -293,7 +298,7 @@ def process_uploaded_video(
     )
 
     report_progress(progress_callback, "index", 0, 1, "Building visual index")
-    index = build_faiss_index(embeddings)
+    index = build_faiss_index(embeddings, expected_dim=embedding_dim)
 
     embeddings_path = artifact_dir / "frame_embeddings.npy"
     metadata_path = artifact_dir / "frame_metadata.csv"

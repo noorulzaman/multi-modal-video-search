@@ -1,4 +1,3 @@
-
 # Python bytecode and cache
 __pycache__/
 *.py[cod]
@@ -23,14 +22,17 @@ ENV/
 # Jupyter
 .ipynb_checkpoints/
 
-# Downloaded source videos and extracted frames
-data/videos/*
-!data/videos/.gitkeep
-data/frames/*
-!data/frames/.gitkeep
+# Legacy MSR-VTT dataset archive
+MSRVTT_Videos.zip
 
-# Generated indexes, embeddings, and metadata
+# Generated data: uploads, extracted frames, embeddings and FAISS indexes.
+# Each folder keeps a .gitkeep so the layout exists after cloning.
+data/videos/*
+data/frames/*
+data/uploads/*
+data/processed/*
 artifacts/*
+!data/*/.gitkeep
 !artifacts/.gitkeep
 
 # Logs and temporary files
@@ -42,22 +44,3 @@ Thumbs.db
 # IDE-specific settings
 .vscode/
 .idea/
-
-
-#Dataset
-MSRVTT_Videos.zip
-
-# User-uploaded videos
-data/uploads/*
-!data/uploads/.gitkeep
-
-# Processed uploaded-video frames
-data/processed/*
-!data/processed/.gitkeep
-
-# Uploaded-video embeddings and FAISS indexes
-artifacts/uploaded/*
-!artifacts/uploaded/.gitkeep
-
-data/processed/*
-!data/processed/.gitkeep
