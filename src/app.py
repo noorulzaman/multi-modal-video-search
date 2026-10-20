@@ -7,34 +7,26 @@ import subprocess
 from pathlib import Path
 
 import cv2
-import faiss
-import numpy as np
-import open_clip
-import pandas as pd
 import streamlit as st
-import torch
 
-from src.upload_pipeline import process_uploaded_video
+from src import config, models
 from src.query_corrector import correct_query
-from src.search import SIMILARITY_THRESHOLD, evaluate_best_match
+from src.search import (
+    IndexNotReady,
+    build_query_variants,
+    index_status,
+    load_video_index,
+    search_video,
+)
+from src.upload_pipeline import process_uploaded_video
 
 
 # --------------------------------------------------
 # Project configuration
 # --------------------------------------------------
 
-ROOT = Path(__file__).resolve().parent.parent
-UPLOAD_DIR = ROOT / "data" / "uploads"
-
-MODEL_NAME = "ViT-B-32"
-PRETRAINED = "laion2b_s34b_b79k"
-
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "mkv", "webm"}
-
-# Search settings. These are internal settings, not UI controls.
-CANDIDATE_RETRIEVAL_COUNT = 20
-MAX_CANDIDATE_MATCHES = 1
 
 
 # --------------------------------------------------
@@ -50,9 +42,41 @@ st.set_page_config(
 st.title("🎬 Multimodal Video Search")
 
 st.write(
-    "Upload a video, prepare its visual index, and search "
-    "for scenes using natural-language descriptions."
+    "Upload a video, index what it shows and what is said in it, and "
+    "search for moments using natural-language descriptions."
 )
+
+with st.sidebar:
+    st.header("Search settings")
+
+    use_speech = st.toggle(
+        "Search speech",
+        value=True,
+        help="Also match the query against what is said in the video.",
+    )
+    use_correction = st.toggle(
+        "Spelling correction",
+        value=True,
+        help=(
+            "Search with both your query and a spell-checked version, "
+            "keeping whichever matches better."
+        ),
+    )
+    use_rerank = st.toggle(
+        "AI double-check (slower)",
+        value=False,
+        help=(
+            f"Re-rank the top candidates with {config.RERANK_MODEL}. "
+            "The first use downloads about 4 GB."
+        ),
+    )
+
+    st.divider()
+    st.caption(
+        f"**Visual model:** {config.VISUAL_MODEL} ({config.VISUAL_PRETRAINED})  \n"
+        f"**Speech model:** {config.ASR_MODEL}  \n"
+        f"**Text model:** {config.TEXT_EMBED_MODEL}"
+    )
 
 
 # --------------------------------------------------
@@ -85,9 +109,9 @@ def save_uploaded_video(uploaded_file):
     safe_stem = re.sub(r"[^A-Za-z0-9_-]+", "_", original_stem)
     safe_stem = safe_stem.strip("_")[:60] or "uploaded_video"
 
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    config.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-    saved_path = UPLOAD_DIR / f"{safe_stem}_{file_hash}.{extension}"
+    saved_path = config.UPLOAD_DIR / f"{safe_stem}_{file_hash}.{extension}"
 
     if not saved_path.exists():
         saved_path.write_bytes(file_bytes)
@@ -202,37 +226,37 @@ def inspect_audio_stream(video_path):
         return None
 
 
-# --------------------------------------------------
-# CLIP resources
-# --------------------------------------------------
-
-@st.cache_resource
-def load_clip_resources():
-    """Load CLIP once and reuse it across Streamlit reruns."""
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    model, _, image_preprocess = open_clip.create_model_and_transforms(
-        MODEL_NAME,
-        pretrained=PRETRAINED,
-        device=device,
-    )
-
-    model.eval()
-
-    return model, image_preprocess, device
-
-
-@st.cache_resource
-def load_clip_tokenizer():
-    """Load the tokenizer used by the CLIP text encoder."""
-
-    return open_clip.get_tokenizer(MODEL_NAME)
+def format_time(seconds):
+    seconds = max(0, int(round(seconds)))
+    return f"{seconds // 60}:{seconds % 60:02d}"
 
 
 # --------------------------------------------------
 # Progress reporting
 # --------------------------------------------------
+
+STAGE_RANGES = {
+    "scenes": (0.00, 0.10),
+    "extract": (0.10, 0.40),
+    "preprocess": (0.40, 0.50),
+    "embed": (0.50, 0.75),
+    "index": (0.75, 0.78),
+    "transcribe": (0.78, 0.95),
+    "transcript_index": (0.95, 0.99),
+    "done": (1.0, 1.0),
+}
+
+FRIENDLY_MESSAGES = {
+    "scenes": "Detecting scene changes...",
+    "extract": "Extracting keyframes...",
+    "preprocess": "Preparing video frames...",
+    "embed": "Analyzing frames with AI...",
+    "index": "Building the visual index...",
+    "transcribe": "Transcribing speech (this can take a minute)...",
+    "transcript_index": "Indexing speech...",
+    "done": "Complete",
+}
+
 
 def update_processing_progress(
     progress_bar,
@@ -245,111 +269,13 @@ def update_processing_progress(
     """Update the progress bar from pipeline stage updates."""
 
     fraction = min(max(current / max(total, 1), 0.0), 1.0)
-
-    stage_ranges = {
-        "extract": (0.0, 0.45),
-        "preprocess": (0.45, 0.60),
-        "embed": (0.60, 0.95),
-        "index": (0.95, 0.99),
-        "done": (1.0, 1.0),
-    }
-
-    start, end = stage_ranges.get(stage, (0.0, 0.0))
-    progress = start + (end - start) * fraction
+    start, end = STAGE_RANGES.get(stage, (0.0, 0.0))
 
     progress_bar.progress(
-        min(progress, 1.0),
-        text="Preparing your video for visual search...",
+        min(start + (end - start) * fraction, 1.0),
+        text="Preparing your video for search...",
     )
-
-    friendly_messages = {
-        "extract": "Extracting representative frames...",
-        "preprocess": "Preparing video frames...",
-        "embed": "Analyzing frames with AI...",
-        "index": "Finishing up...",
-        "done": "Complete",
-    }
-
-    status.caption(friendly_messages.get(stage, "Processing video..."))
-
-
-# --------------------------------------------------
-# Visual search helpers
-# --------------------------------------------------
-
-def search_video_frames(query, top_k, index_path, metadata_path):
-    """Retrieve the highest-scoring frames for a corrected text query."""
-
-    if not query.strip():
-        raise ValueError("Enter a description before searching.")
-
-    if not index_path.is_file() or not metadata_path.is_file():
-        raise FileNotFoundError(
-            "The visual index is not available. Process the video first."
-        )
-
-    model, _, device = load_clip_resources()
-    tokenizer = load_clip_tokenizer()
-
-    tokens = tokenizer([query.strip()]).to(device)
-
-    with torch.inference_mode():
-        text_features = model.encode_text(tokens)
-
-        text_features = text_features / text_features.norm(
-            dim=-1,
-            keepdim=True,
-        ).clamp_min(1e-12)
-
-    query_embedding = (
-        text_features.float()
-        .cpu()
-        .numpy()
-        .astype(np.float32)
-    )
-
-    index = faiss.read_index(str(index_path))
-    metadata = pd.read_csv(metadata_path)
-
-    if index.ntotal != len(metadata):
-        raise ValueError(
-            "The visual index and frame metadata do not match. "
-            "Please process the video again."
-        )
-
-    if index.ntotal == 0:
-        raise ValueError("No indexed frames are available to search.")
-
-    if index.d != query_embedding.shape[1]:
-        raise ValueError(
-            "This video was indexed with a different CLIP model. "
-            "Please process the video again."
-        )
-
-    result_count = min(int(top_k), index.ntotal)
-    scores, indices = index.search(query_embedding, result_count)
-
-    results = []
-
-    for score, row_index in zip(scores[0], indices[0]):
-        if row_index < 0:
-            continue
-
-        row = metadata.iloc[int(row_index)]
-        frame_path = ROOT / str(row["frame_path"])
-
-        if not frame_path.is_file():
-            continue
-
-        results.append(
-            {
-                "path": frame_path,
-                "timestamp": float(row["timestamp_seconds"]),
-                "score": float(score),
-            }
-        )
-
-    return results
+    status.caption(FRIENDLY_MESSAGES.get(stage, "Processing video..."))
 
 
 # --------------------------------------------------
@@ -367,6 +293,7 @@ uploaded_file = st.file_uploader(
 
 video_path = None
 video_info = None
+audio_streams = None
 
 if uploaded_file is None:
     st.info("Upload a video to get started.")
@@ -377,12 +304,6 @@ else:
         video_info = inspect_video(video_path)
 
         st.success("Video uploaded successfully.")
-        st.subheader("Video Preview")
-
-        preview_col, _ = st.columns([1, 2])
-
-        with preview_col:
-            st.video(str(video_path))
 
         col1, col2, col3 = st.columns(3)
 
@@ -397,9 +318,7 @@ else:
 
             st.metric(
                 "Duration",
-                f"{duration:.1f} seconds"
-                if duration is not None
-                else "Unavailable",
+                format_time(duration) if duration is not None else "Unavailable",
             )
 
         with col3:
@@ -432,13 +351,34 @@ st.divider()
 # Section 2: Process video
 # --------------------------------------------------
 
-st.header("2. Prepare for Visual Search")
+st.header("2. Prepare for Search")
+
+upload_id = None
+visual_ready = False
 
 if video_path is not None and Path(video_path).is_file():
 
+    upload_id = config.upload_id_for(video_path)
+    visual_ready, transcript_manifest = index_status(upload_id)
+
+    if visual_ready:
+        visual_manifest = json.loads(
+            (config.visual_index_dir(upload_id) / "manifest.json").read_text()
+        )
+        speech_note = (
+            f", {transcript_manifest['windows']} speech passages"
+            if transcript_manifest
+            else ", speech not indexed"
+        )
+        st.caption(
+            f"Already processed: {visual_manifest['scenes']} scenes, "
+            f"{visual_manifest['segments']} segments, "
+            f"{visual_manifest['frames_embedded']} keyframes{speech_note}."
+        )
+
     interval_seconds = st.select_slider(
-        "Frame sampling interval",
-        options=[1, 2, 3, 5, 10],
+        "Keyframe spacing",
+        options=[1, 2, 3, 5],
         value=2,
         format_func=lambda value: (
             f"Every {value} second"
@@ -446,20 +386,28 @@ if video_path is not None and Path(video_path).is_file():
             else f"Every {value} seconds"
         ),
         help=(
-            "Smaller intervals capture more detail but take longer. "
-            "Larger intervals are faster but may miss brief events."
+            "Each detected scene gets at least one keyframe. Smaller "
+            "spacing captures more detail inside long scenes but takes longer."
+        ),
+    )
+
+    has_audio = audio_streams is None or bool(audio_streams)
+
+    transcribe = st.checkbox(
+        "Transcribe speech",
+        value=has_audio,
+        disabled=not has_audio,
+        help=(
+            f"Uses {config.ASR_MODEL}. The first run downloads about 1.6 GB."
         ),
     )
 
     if st.button(
-        "Process Video",
+        "Re-process Video" if visual_ready else "Process Video",
         type="primary",
-        use_container_width=True,
+        width="stretch",
     ):
-        progress_bar = st.progress(
-            0,
-            text="Starting video processing...",
-        )
+        progress_bar = st.progress(0, text="Starting video processing...")
         status = st.empty()
 
         def progress_callback(stage, current, total, message):
@@ -473,27 +421,28 @@ if video_path is not None and Path(video_path).is_file():
             )
 
         try:
-            with st.spinner("Loading AI model..."):
-                model, image_preprocess, device = load_clip_resources()
+            with st.spinner("Loading AI models..."):
+                encoder = models.load_visual_encoder()
+                text_embedder = models.load_text_embedder() if transcribe else None
 
-            process_uploaded_video(
+            summary = process_uploaded_video(
                 video_path=video_path,
-                model=model,
-                preprocess=image_preprocess,
-                device=device,
-                embedding_dim=model.visual.output_dim,
+                encoder=encoder,
                 interval_seconds=int(interval_seconds),
-                batch_size=32,
+                transcribe=transcribe,
+                text_embedder=text_embedder,
                 progress_callback=progress_callback,
             )
 
-            progress_bar.progress(
-                1.0,
-                text="Video processing complete.",
-            )
+            progress_bar.progress(1.0, text="Video processing complete.")
             status.empty()
+            st.session_state.pop("search_results", None)
+            visual_ready = True
 
-            st.success("Your video is ready for visual search.")
+            st.success(
+                f"Your video is ready: {summary['scenes']} scenes and "
+                f"{summary['frames_embedded']} keyframes indexed."
+            )
 
         except Exception as exc:
             progress_bar.empty()
@@ -505,177 +454,147 @@ else:
 
 
 # --------------------------------------------------
-# Section 3: Search and play matching video moments
+# Section 3: Search and play matching moments
 # --------------------------------------------------
 
 st.divider()
 st.header("3. Search Your Video")
 
-if video_path is not None and Path(video_path).is_file():
 
-    upload_id = Path(video_path).stem.rsplit("_", 1)[-1]
-    artifact_dir = ROOT / "artifacts" / "uploaded" / upload_id
+def render_moment(moment, rank, selected):
+    """One result row: thumbnail, time range, scores, speech, play button."""
 
-    index_path = artifact_dir / "frames.faiss"
-    metadata_path = artifact_dir / "frame_metadata.csv"
+    thumb_col, info_col = st.columns([1, 3])
 
-    if not index_path.is_file() or not metadata_path.is_file():
-        st.info(
-            "Process this video first. After processing, "
-            "you can search and play matching moments."
+    with thumb_col:
+        if moment["frame_path"] is not None:
+            st.image(str(config.ROOT / moment["frame_path"]), width="stretch")
+
+    with info_col:
+        marker = "▶ " if selected else ""
+        st.markdown(
+            f"**{marker}#{rank} · {format_time(moment['start_seconds'])} – "
+            f"{format_time(moment['end_seconds'])}**"
         )
 
-    else:
-        st.write(
-            "Describe a scene, object, person, or activity "
-            "to find a matching moment in your video."
-        )
+        signals = []
+        if moment["visual_score"] is not None:
+            signals.append(f"🖼 visual {moment['visual_score']:.3f}")
+        if moment["transcript_score"] is not None:
+            signals.append(f"🗣 speech {moment['transcript_score']:.2f}")
+        if moment["rerank_score"] is not None:
+            signals.append(f"✅ AI check {moment['rerank_score']:.0%}")
+        st.caption(" · ".join(signals))
 
-        with st.form("visual_search_form"):
-            query = st.text_input(
-                "What do you want to find?",
-                placeholder="e.g. a person walking through a room",
-            )
+        if moment["rerank_score"] is not None and moment["rerank_score"] < 0.5:
+            st.caption("The AI check thinks this is probably not a match.")
 
-            submitted = st.form_submit_button(
-                "Search Video",
-                type="primary",
-                use_container_width=True,
-            )
+        if moment["transcript_text"]:
+            st.markdown(f"> _{moment['transcript_text'][:300]}_")
 
-        if submitted:
-            # Clear previous results so a failed search cannot show stale data.
-            st.session_state.pop("visual_search_results", None)
+        if st.button("Play this moment", key=f"play_{rank}"):
+            st.session_state["selected_moment"] = rank - 1
+            st.rerun()
 
-            if not query.strip():
-                st.warning("Enter a description before searching.")
 
-            else:
-                try:
-                    # Correct the user's prompt before CLIP text encoding.
-                    with st.spinner(
-                        "Correcting your query and searching video frames..."
-                    ):
-                        corrected_query = correct_query(query)
-
-                        if not corrected_query.strip():
-                            raise ValueError(
-                                "The query became empty after correction."
-                            )
-
-                        candidates = search_video_frames(
-                            query=corrected_query,
-                            top_k=CANDIDATE_RETRIEVAL_COUNT,
-                            index_path=index_path,
-                            metadata_path=metadata_path,
-                        )
-
-                    evaluation = evaluate_best_match(candidates)
-                    best_match = evaluation["best_match"]
-
-                    matching_results = (
-                        [best_match]
-                        if evaluation["accepted"] and best_match is not None
-                        else []
-                    )[:MAX_CANDIDATE_MATCHES]
-
-                    st.session_state["visual_search_results"] = {
-                        "upload_id": upload_id,
-                        "original_query": query.strip(),
-                        "corrected_query": corrected_query,
-                        "results": matching_results,
-                        "best_score": evaluation["best_score"],
-                        "competitor_score": evaluation["competitor_score"],
-                        "score_margin": evaluation["score_margin"],
-                        "reason": evaluation["reason"],
-                    }
-
-                except Exception as exc:
-                    st.error(
-                        "Search failed. Please check that the video "
-                        f"has been processed. Details: {exc}"
-                    )
-
-        saved_results = st.session_state.get("visual_search_results")
-
-        if saved_results and saved_results["upload_id"] == upload_id:
-            results = saved_results["results"]
-
-            st.subheader(
-                f'Results for "{saved_results["original_query"]}"'
-            )
-
-            original_query = saved_results["original_query"]
-            corrected_query = saved_results["corrected_query"]
-
-            if original_query != corrected_query:
-                st.info(f"**Corrected query:** {corrected_query}")
-            else:
-                st.caption("No spelling or grammar corrections were needed.")
-
-            best_score = saved_results["best_score"]
-            competitor_score = saved_results["competitor_score"]
-            score_margin = saved_results["score_margin"]
-
-            if not results:
-                st.warning("No sufficiently reliable match was accepted.")
-
-                st.write(saved_results["reason"])
-
-                if best_score is not None:
-                    st.write(
-                        f"Best candidate similarity: {best_score:.3f}. "
-                        f"Minimum required: {SIMILARITY_THRESHOLD:.2f}."
-                    )
-
-                if competitor_score is not None and score_margin is not None:
-                    st.write(
-                        f"Distinct-time competitor similarity: "
-                        f"{competitor_score:.3f}. "
-                        f"Score margin: {score_margin:.3f}."
-                    )
-
-                st.caption(
-                    "This does not prove that the scene is absent. "
-                    "Try a more specific description. Similarity scores "
-                    "and margins are heuristic signals, not probabilities."
-                )
-
-            else:
-                result = results[0]
-
-                st.success("A matching moment was found.")
-
-                st.caption(
-                    f"Similarity: {result['score']:.3f} "
-                    f"(minimum: {SIMILARITY_THRESHOLD:.2f})"
-                )
-
-                if competitor_score is not None and score_margin is not None:
-                    st.caption(
-                        f"Distinct-time score margin: {score_margin:.3f}"
-                    )
-                else:
-                    st.caption(
-                        "No sufficiently separated competitor was available "
-                        "to calculate a score margin."
-                    )
-
-                st.markdown("### Matching moment")
-
-                st.write(
-                    f"**Timestamp:** {result['timestamp']:.1f} seconds"
-                )
-
-                st.markdown("### Video playback")
-
-                st.video(
-                    str(video_path),
-                    start_time=max(0, int(result["timestamp"])),
-                )
+if not visual_ready or upload_id is None:
+    st.info(
+        "Process this video first. After processing, "
+        "you can search and play matching moments."
+    )
 
 else:
-    st.info("Upload a valid video to search its visual content.")
+    with st.form("search_form"):
+        query = st.text_input(
+            "What do you want to find?",
+            placeholder="e.g. a person walking through a room, or something someone says",
+        )
+
+        submitted = st.form_submit_button(
+            "Search Video",
+            type="primary",
+            width="stretch",
+        )
+
+    if submitted:
+        # Clear previous results so a failed search cannot show stale data.
+        st.session_state.pop("search_results", None)
+
+        if not query.strip():
+            st.warning("Enter a description before searching.")
+
+        else:
+            try:
+                with st.spinner("Searching your video..."):
+                    corrected = correct_query(query) if use_correction else None
+                    variants = build_query_variants(query, corrected)
+
+                    encoder = models.load_visual_encoder()
+                    text_embedder = models.load_text_embedder() if use_speech else None
+
+                if use_rerank:
+                    with st.spinner("Loading the AI double-check model..."):
+                        reranker = models.load_reranker()
+                else:
+                    reranker = None
+
+                with st.spinner("Ranking moments..."):
+                    moments = search_video(
+                        load_video_index(upload_id),
+                        encoder,
+                        variants,
+                        text_embedder=text_embedder,
+                        use_speech=use_speech,
+                        reranker=reranker,
+                    )
+
+                st.session_state["search_results"] = {
+                    "upload_id": upload_id,
+                    "query": query.strip(),
+                    "corrected": corrected,
+                    "moments": moments,
+                }
+                st.session_state["selected_moment"] = 0
+
+            except IndexNotReady as exc:
+                st.warning(str(exc))
+
+            except Exception as exc:
+                st.error(f"Search failed: {exc}")
+
+    saved = st.session_state.get("search_results")
+
+    if saved and saved["upload_id"] == upload_id:
+        st.subheader(f'Results for "{saved["query"]}"')
+
+        corrected = saved["corrected"]
+        if corrected and corrected.strip().lower() != saved["query"].lower():
+            st.info(f"**Also searched for:** {corrected}")
+
+        moments = saved["moments"]
+
+        if not moments:
+            st.warning(
+                "No matching moments were found. Try describing what is "
+                "visible or what is said in a different way."
+            )
+
+        else:
+            selected = min(st.session_state.get("selected_moment", 0), len(moments) - 1)
+            current = moments[selected]
+
+            st.video(
+                str(video_path),
+                start_time=max(0, int(current["start_seconds"])),
+            )
+
+            st.caption(
+                "Moments are ranked by how well they match; scores are "
+                "relative signals, not probabilities."
+            )
+
+            for rank, moment in enumerate(moments, start=1):
+                render_moment(moment, rank, selected == rank - 1)
 
 
 # --------------------------------------------------
@@ -683,4 +602,4 @@ else:
 # --------------------------------------------------
 
 st.divider()
-st.caption("Powered by OpenCLIP with spelling and grammar correction")
+st.caption("Powered by OpenCLIP, Whisper, Sentence Transformers and Qwen3-VL")

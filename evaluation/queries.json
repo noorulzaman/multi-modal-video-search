@@ -1,0 +1,46 @@
+{
+  "videos": {
+    "06270c063c14075c": "Timepiece_2024___Short_Film_1080p_06270c063c14075c.mp4",
+    "cde651cafe216385": "La_Casa_De_Papel____Bella_Ciao_1080p60_cde651cafe216385.mp4"
+  },
+  "queries": [
+    {"video": "06270c063c14075c", "type": "visual", "query": "a title card with the word TIMEPIECE", "ranges": [[4.5, 9.0]]},
+    {"video": "06270c063c14075c", "type": "visual", "query": "a digital alarm clock on a wooden box with a sticky note", "ranges": [[8.7, 14.5]]},
+    {"video": "06270c063c14075c", "type": "visual", "query": "a girl falling asleep at her desk while studying", "ranges": [[24.5, 34.0]]},
+    {"video": "06270c063c14075c", "type": "visual", "query": "a girl brushing her teeth in the bathroom", "ranges": [[39.5, 41.0]]},
+    {"video": "06270c063c14075c", "type": "visual", "query": "tying the laces of a sneaker", "ranges": [[67.0, 72.0]]},
+    {"video": "06270c063c14075c", "type": "visual", "query": "a girl riding a bicycle through a park", "ranges": [[81.5, 105.0]]},
+    {"video": "06270c063c14075c", "type": "visual", "query": "locking a bike to a post", "ranges": [[114.0, 116.0]]},
+    {"video": "06270c063c14075c", "type": "visual", "query": "a girl sitting alone on a park bench", "ranges": [[128.0, 134.0]]},
+    {"video": "06270c063c14075c", "type": "visual", "query": "a cyclist in a red jacket", "ranges": [[133.8, 136.0]]},
+    {"video": "06270c063c14075c", "type": "visual", "query": "an old man in a flat cap and scarf", "ranges": [[200.9, 209.0], [224.0, 230.0], [287.0, 342.0]]},
+    {"video": "06270c063c14075c", "type": "visual", "query": "close-up of a hand holding a pocket watch", "ranges": [[209.5, 213.5], [245.0, 248.5]]},
+    {"video": "06270c063c14075c", "type": "visual", "query": "an old man and a girl sitting together on a bench in autumn", "ranges": [[145.0, 200.5], [214.0, 217.5], [230.5, 232.0], [249.0, 286.5], [339.0, 342.5]]},
+    {"video": "06270c063c14075c", "type": "visual", "query": "a girl waving down a bus by the roadside", "ranges": [[343.0, 350.0]]},
+    {"video": "06270c063c14075c", "type": "visual", "query": "a double-decker bus pulling up at a bus stop", "ranges": [[356.5, 382.0], [107.5, 109.5]]},
+    {"video": "06270c063c14075c", "type": "visual", "query": "a handwritten note on old torn paper", "ranges": [[394.0, 408.0], [421.0, 434.0], [462.5, 467.0]]},
+    {"video": "06270c063c14075c", "type": "visual", "query": "a woman in a brown leather jacket laughing on the bus", "ranges": [[446.0, 459.0]]},
+    {"video": "06270c063c14075c", "type": "visual", "query": "a girl on a bus looking out of the window", "ranges": [[386.0, 392.0], [466.5, 478.0]]},
+    {"video": "06270c063c14075c", "type": "visual", "query": "film credits listing the cast and crew", "ranges": [[489.0, 514.0]]},
+    {"video": "06270c063c14075c", "type": "speech", "query": "she missed her bus and her exam", "ranges": [[163.5, 191.0]]},
+    {"video": "06270c063c14075c", "type": "speech", "query": "the broken watch was passed down from his grandad", "ranges": [[209.0, 227.0]]},
+    {"video": "06270c063c14075c", "type": "speech", "query": "do you take this bus often", "ranges": [[250.0, 274.0]]},
+    {"video": "06270c063c14075c", "type": "speech", "query": "going to visit someone they have not seen in years", "ranges": [[285.0, 303.0]]},
+    {"video": "06270c063c14075c", "type": "speech", "query": "I ran out of time and had to go elsewhere", "ranges": [[325.0, 334.0]]},
+    {"video": "06270c063c14075c", "type": "speech", "query": "asking a stranger what time it is", "ranges": [[444.0, 456.0]]},
+
+    {"video": "cde651cafe216385", "type": "visual", "query": "people drinking shots of liquor", "ranges": [[1.0, 6.0]]},
+    {"video": "cde651cafe216385", "type": "visual", "query": "slicing a lemon with a knife", "ranges": [[1.8, 2.6]]},
+    {"video": "cde651cafe216385", "type": "visual", "query": "a smiling man in a black fedora hat", "ranges": [[6.0, 7.0]]},
+    {"video": "cde651cafe216385", "type": "visual", "query": "a smiling man with glasses and a beard wearing a suit", "ranges": [[7.8, 9.0]]},
+    {"video": "cde651cafe216385", "type": "visual", "query": "a man in a red jumpsuit raising his arms in celebration", "ranges": [[24.5, 25.8], [98.5, 100.2]]},
+    {"video": "cde651cafe216385", "type": "visual", "query": "a woman in a bikini on a beach with palm trees", "ranges": [[28.3, 29.3]]},
+    {"video": "cde651cafe216385", "type": "visual", "query": "a wedding celebration with monks in white robes", "ranges": [[50.3, 52.0], [78.0, 80.0]]},
+    {"video": "cde651cafe216385", "type": "visual", "query": "a bathtub in a luxurious room", "ranges": [[70.5, 72.2]]},
+    {"video": "cde651cafe216385", "type": "visual", "query": "a person shouting into a megaphone", "ranges": [[98.8, 99.4]]},
+    {"video": "cde651cafe216385", "type": "visual", "query": "men in suits toasting with glasses of whiskey", "ranges": [[100.5, 105.0]]},
+    {"video": "cde651cafe216385", "type": "speech", "query": "the chorus bella ciao", "ranges": [[44.0, 50.0], [66.9, 76.0]]},
+    {"video": "cde651cafe216385", "type": "speech", "query": "a lyric about feeling like dying", "ranges": [[30.0, 39.0]]},
+    {"video": "cde651cafe216385", "type": "speech", "query": "a lyric about the mountain", "ranges": [[57.0, 67.0], [75.0, 80.3]]}
+  ]
+}
